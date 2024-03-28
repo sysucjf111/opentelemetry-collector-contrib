@@ -18,7 +18,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
-	"golang.org/x/time/rate"
 )
 
 type worker struct {
@@ -28,11 +27,12 @@ type worker struct {
 	propagateContext bool            // whether the worker needs to propagate the trace context via HTTP headers
 	statusCode       codes.Code      // the status code set for the child and parent spans
 	totalDuration    time.Duration   // how long to run the test for (overrides `numTraces`)
-	limitPerSecond   rate.Limit      // how many spans per second to generate
+	limitPerSecond   int64           // how many spans per second to generate
 	wg               *sync.WaitGroup // notify when done
 	loadSize         int             // desired minimum size in MB of string data for each generated trace
 	spanDuration     time.Duration   // duration of generated spans
 	logger           *zap.Logger
+	counter          *Counter
 }
 
 const (
@@ -43,7 +43,7 @@ const (
 
 func (w worker) simulateTraces(telemetryAttributes []attribute.KeyValue) {
 	tracer := otel.Tracer("telemetrygen")
-	limiter := rate.NewLimiter(w.limitPerSecond, 1)
+	limiter := NewRateLimiter(w.limitPerSecond)
 	var i int
 
 	for w.running.Load() {
@@ -57,6 +57,10 @@ func (w worker) simulateTraces(telemetryAttributes []attribute.KeyValue) {
 			trace.WithSpanKind(trace.SpanKindClient),
 			trace.WithTimestamp(spanStart),
 		)
+		// root span也要计数
+		w.counter.Add()
+		limiter.Add(1, time.Now())
+
 		sp.SetAttributes(telemetryAttributes...)
 		for j := 0; j < w.loadSize; j++ {
 			sp.SetAttributes(attribute.String(fmt.Sprintf("load-%v", j), string(make([]byte, charactersPerMB))))
@@ -82,10 +86,8 @@ func (w worker) simulateTraces(telemetryAttributes []attribute.KeyValue) {
 				trace.WithTimestamp(spanStart),
 			)
 			child.SetAttributes(telemetryAttributes...)
-
-			if err := limiter.Wait(context.Background()); err != nil {
-				w.logger.Fatal("limiter waited failed, retry", zap.Error(err))
-			}
+			w.counter.Add()
+			limiter.Add(1, time.Now())
 
 			endTimestamp = trace.WithTimestamp(spanEnd)
 			child.SetStatus(w.statusCode, "")
